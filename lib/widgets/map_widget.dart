@@ -5,6 +5,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:async';
+import '../services/convoy_service.dart';
+import '../services/dummy_user_service.dart';
 
 class SearchResult {
   final String name;
@@ -53,18 +55,107 @@ class _MapWidgetState extends State<MapWidget> {
   Timer? _searchDebounce;
   bool _isMapReady = false;
 
+  // Convoy functionality
+  final ConvoyService _convoyService = ConvoyService();
+  bool _isInConvoy = false;
+  String _currentConvoyId = '';
+  final Map<String, Marker> _convoyMarkers = {};
+  final TextEditingController _convoyIdController = TextEditingController();
+  bool _showConvoyDialog = false;
+
+  // Dummy user functionality
+  DummyUserService? _dummyUserService;
+  bool _isDummyUserActive = false;
+  final Map<String, List<LatLng>> _memberRoutes = {};
+
   @override
   void initState() {
     super.initState();
     _getCurrentLocation();
+    _setupConvoyListeners();
   }
 
   @override
   void dispose() {
     _searchController.dispose();
     _searchDebounce?.cancel();
+    _convoyIdController.dispose();
+    _convoyService.dispose();
+    _dummyUserService?.dispose();
     super.dispose();
   }
+
+  void _setupConvoyListeners() {
+    // Listen for convoy member location updates
+    _convoyService.locationUpdates.listen((location) {
+      setState(() {
+        // Update member marker
+        _convoyMarkers[location.userId] = Marker(
+          point: location.coordinates,
+          width: 40,
+          height: 40,
+          child: Container(
+            decoration: BoxDecoration(
+              color: location.isOnJourney ? Colors.purple.withOpacity(0.8) : Colors.blue.withOpacity(0.8),
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 2),
+            ),
+            child: Icon(
+              location.isOnJourney ? Icons.directions_car : Icons.person,
+              color: Colors.white,
+              size: 20,
+            ),
+          ),
+        );
+        
+        // Update member route if available
+        if (location.routePoints != null && location.routePoints!.isNotEmpty) {
+          _memberRoutes[location.userId] = location.routePoints!;
+        }
+      });
+      
+      print('📍 Location update from ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}] - Journey: ${location.isOnJourney}');
+      
+      // If this is a dummy user, center the map on them for the first few updates
+      if (location.userId.startsWith('dummy_') && _convoyMarkers.length <= 2) {
+        print('🗺️ Centering map on dummy user location');
+        _animatedMapMove(location.coordinates, 15.0);
+      }
+    });
+
+    // Listen for member joined
+    _convoyService.memberJoined.listen((userId) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('👥 $userId joined the convoy')),
+      );
+    });
+
+    // Listen for member left
+    _convoyService.memberLeft.listen((userId) {
+      setState(() {
+        _convoyMarkers.remove(userId);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('👋 $userId left the convoy')),
+      );
+    });
+
+    // Listen for connection status
+    _convoyService.connectionStatus.listen((status) {
+      print('🔌 Connection status: $status');
+      if (status == 'connected') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('✅ Connected to convoy server')),
+        );
+      } else if (status == 'error') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('❌ Failed to connect to convoy server')),
+        );
+      }
+    });
+  }
+
+
 
   Future<void> _getCurrentLocation() async {
     print('📍 Getting current location...');
@@ -110,6 +201,23 @@ class _MapWidgetState extends State<MapWidget> {
     if (_currentPosition != null && _isMapReady) {
       print('📍 Centering map on current location');
       _animatedMapMove(LatLng(_currentPosition!.latitude, _currentPosition!.longitude), 20.0);
+    }
+  }
+
+  void _centerOnDummyUser() {
+    // Find the first dummy user marker
+    final dummyUserEntry = _convoyMarkers.entries
+        .where((entry) => entry.key.startsWith('dummy_'))
+        .firstOrNull;
+    
+    if (dummyUserEntry != null && _isMapReady) {
+      print('🚗 Centering map on dummy user');
+      _animatedMapMove(dummyUserEntry.value.point, 15.0);
+    } else {
+      print('❌ No dummy user found on map');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('❌ No dummy user found on map')),
+      );
     }
   }
 
@@ -246,6 +354,143 @@ class _MapWidgetState extends State<MapWidget> {
     }
   }
 
+  // Convoy functions
+  void _showConvoyJoinDialog() {
+    print('🔧 Showing convoy join dialog...');
+    setState(() {
+      _showConvoyDialog = true;
+    });
+    
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Join Convoy'),
+          content: TextField(
+            controller: _convoyIdController,
+            decoration: const InputDecoration(
+              labelText: 'Convoy ID',
+              hintText: 'Enter convoy ID',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                print('❌ Convoy join cancelled');
+                Navigator.of(context).pop();
+              },
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                print('✅ Convoy join button pressed');
+                _joinConvoy();
+                Navigator.of(context).pop();
+              },
+              child: const Text('Join'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _joinConvoy() {
+    final convoyId = _convoyIdController.text.trim();
+    print('🔧 Attempting to join convoy: "$convoyId"');
+    
+    if (convoyId.isEmpty) {
+      print('❌ Convoy ID is empty');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('❌ Please enter a convoy ID')),
+      );
+      return;
+    }
+
+    print('🔌 Connecting to convoy server with ID: $convoyId');
+    _convoyService.connect('user_${DateTime.now().millisecondsSinceEpoch}', convoyId: convoyId).then((success) {
+      print('🔌 Connection result: $success');
+      if (success) {
+        setState(() {
+          _isInConvoy = true;
+          _currentConvoyId = convoyId;
+          _showConvoyDialog = false;
+        });
+        print('📍 Starting location tracking...');
+        _convoyService.startLocationTracking();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('🚗 Joined convoy: $convoyId')),
+        );
+        print('✅ Successfully joined convoy: $convoyId');
+      } else {
+        print('❌ Failed to join convoy');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('❌ Failed to connect to convoy server')),
+        );
+      }
+    }).catchError((error) {
+      print('❌ Error joining convoy: $error');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Error: $error')),
+      );
+    });
+  }
+
+  void _leaveConvoy() {
+    _convoyService.leaveConvoy();
+    _convoyService.stopLocationTracking();
+    setState(() {
+      _isInConvoy = false;
+      _currentConvoyId = '';
+      _convoyMarkers.clear();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('👋 Left convoy')),
+    );
+  }
+
+
+
+  void _startDummyUser() {
+    if (_currentConvoyId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('❌ Please join a convoy first')),
+      );
+      return;
+    }
+
+    final dummyUserId = 'dummy_${DateTime.now().millisecondsSinceEpoch}';
+    // Create a NEW ConvoyService for the dummy user!
+    final dummyConvoyService = ConvoyService();
+    dummyConvoyService.connect(dummyUserId, convoyId: _currentConvoyId);
+    _dummyUserService = DummyUserService(dummyConvoyService, dummyUserId, _currentConvoyId);
+    _dummyUserService!.startDummyUser();
+    
+    setState(() {
+      _isDummyUserActive = true;
+    });
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('🚗 Started dummy user: $dummyUserId')),
+    );
+    print('🚗 Dummy user started: $dummyUserId in convoy: $_currentConvoyId');
+  }
+
+  void _stopDummyUser() {
+    _dummyUserService?.stopDummyUser();
+    _dummyUserService?.dispose();
+    _dummyUserService = null;
+    
+    setState(() {
+      _isDummyUserActive = false;
+    });
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('🛑 Stopped dummy user')),
+    );
+    print('🛑 Dummy user stopped');
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_currentPosition == null) {
@@ -299,19 +544,17 @@ class _MapWidgetState extends State<MapWidget> {
                     height: 40,
                     child: Container(
                       decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.8),
+                        color: Colors.blue,
                         shape: BoxShape.circle,
                         border: Border.all(color: Colors.white, width: 2),
                       ),
-                      child: const Icon(
-                        Icons.my_location,
-                        color: Colors.white,
-                        size: 20,
-                      ),
+                      child: const Icon(Icons.my_location, color: Colors.white, size: 20),
                     ),
                   ),
+                  ..._convoyMarkers.values,
                 ],
               ),
+              // Route polyline
               if (_routePoints.isNotEmpty)
                 PolylineLayer(
                   polylines: [
@@ -321,6 +564,21 @@ class _MapWidgetState extends State<MapWidget> {
                       color: Colors.blue,
                     ),
                   ],
+                ),
+              // Convoy member routes
+              if (_memberRoutes.isNotEmpty)
+                PolylineLayer(
+                  polylines: _memberRoutes.entries.map((entry) {
+                    final userId = entry.key;
+                    final routePoints = entry.value;
+                    final isDummyUser = userId.startsWith('dummy_');
+                    
+                    return Polyline(
+                      points: routePoints,
+                      strokeWidth: 3,
+                      color: isDummyUser ? Colors.purple : Colors.green,
+                    );
+                  }).toList(),
                 ),
               if (_routePoints.isNotEmpty)
                 MarkerLayer(
@@ -348,18 +606,18 @@ class _MapWidgetState extends State<MapWidget> {
           ),
           Positioned(
             top: MediaQuery.of(context).padding.top + 10,
-            left: 16,
-            right: 16,
+            left: 10,
+            right: 10,
             child: Column(
               children: [
                 Container(
                   decoration: BoxDecoration(
                     color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(25),
                     boxShadow: [
                       BoxShadow(
                         color: Colors.black.withOpacity(0.1),
-                        blurRadius: 8,
+                        blurRadius: 10,
                         offset: const Offset(0, 2),
                       ),
                     ],
@@ -381,20 +639,20 @@ class _MapWidgetState extends State<MapWidget> {
                             )
                           : null,
                       border: InputBorder.none,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
                     ),
                   ),
                 ),
-                if (_showSearchResults && _searchResults.isNotEmpty)
+                if (_showSearchResults)
                   Container(
-                    margin: const EdgeInsets.only(top: 8),
+                    margin: const EdgeInsets.only(top: 5),
                     decoration: BoxDecoration(
                       color: Colors.white,
-                      borderRadius: BorderRadius.circular(12),
+                      borderRadius: BorderRadius.circular(10),
                       boxShadow: [
                         BoxShadow(
                           color: Colors.black.withOpacity(0.1),
-                          blurRadius: 8,
+                          blurRadius: 10,
                           offset: const Offset(0, 2),
                         ),
                       ],
@@ -403,13 +661,11 @@ class _MapWidgetState extends State<MapWidget> {
                       shrinkWrap: true,
                       itemCount: _searchResults.length,
                       itemBuilder: (context, index) {
-                        final place = _searchResults[index];
+                        final result = _searchResults[index];
                         return ListTile(
-                          title: Text(
-                            place.name,
-                            style: const TextStyle(fontSize: 14),
-                          ),
-                          onTap: () => _selectPlace(place),
+                          title: Text(result.name),
+                          subtitle: Text(result.address),
+                          onTap: () => _selectPlace(result),
                         );
                       },
                     ),
@@ -419,22 +675,48 @@ class _MapWidgetState extends State<MapWidget> {
           ),
           Positioned(
             top: MediaQuery.of(context).padding.top + 80,
-            right: 16,
+            right: 10,
             child: Column(
               children: [
+                FloatingActionButton.small(
+                  onPressed: _isInConvoy ? _leaveConvoy : _showConvoyJoinDialog,
+                  backgroundColor: _isInConvoy ? Colors.red : Colors.green,
+                  child: Icon(
+                    _isInConvoy ? Icons.exit_to_app : Icons.group,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                if (_isInConvoy)
+                  FloatingActionButton.small(
+                    onPressed: _isDummyUserActive ? _stopDummyUser : _startDummyUser,
+                    backgroundColor: _isDummyUserActive ? Colors.orange : Colors.purple,
+                    child: Icon(
+                      _isDummyUserActive ? Icons.stop : Icons.directions_car,
+                      color: Colors.white,
+                    ),
+                  ),
+                if (_isInConvoy) const SizedBox(height: 8),
                 FloatingActionButton.small(
                   onPressed: _centerOnLocation,
                   backgroundColor: Colors.white,
                   child: const Icon(Icons.my_location, color: Colors.black87),
                 ),
+                if (_isDummyUserActive) const SizedBox(height: 8),
+                if (_isDummyUserActive)
+                  FloatingActionButton.small(
+                    onPressed: _centerOnDummyUser,
+                    backgroundColor: Colors.purple,
+                    child: const Icon(Icons.directions_car, color: Colors.white),
+                  ),
               ],
             ),
           ),
           if (_routeInfo != null)
             Positioned(
-              bottom: MediaQuery.of(context).padding.bottom + 16,
-              left: 16,
-              right: 16,
+              bottom: MediaQuery.of(context).padding.bottom + 20,
+              left: 20,
+              right: 20,
               child: Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -443,45 +725,117 @@ class _MapWidgetState extends State<MapWidget> {
                   boxShadow: [
                     BoxShadow(
                       color: Colors.black.withOpacity(0.1),
-                      blurRadius: 8,
+                      blurRadius: 10,
                       offset: const Offset(0, 2),
                     ),
                   ],
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Route',
-                            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${_routeInfo!.distanceText} • ${_routeInfo!.durationText}',
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: Colors.grey[600],
-                            ),
-                          ),
-                        ],
+                    Text(
+                      'Route to ${_selectedDestination?.name ?? 'Destination'}',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-                    if (_isLoadingRoute)
-                      const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Icon(Icons.directions_car, color: Colors.blue, size: 20),
+                        const SizedBox(width: 8),
+                        Text('${_routeInfo!.distanceText} • ${_routeInfo!.durationText}'),
+                      ],
+                    ),
                   ],
                 ),
+              ),
+            ),
+          if (_isInConvoy)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 10,
+              right: 10,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.9),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  '🚗 Convoy: $_currentConvoyId',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+          if (_isDummyUserActive)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 10,
+              right: 10,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.9),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                                  child: const Text(
+                    '🚗 Dummy User Active',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
               ),
             ),
         ],
       ),
     );
   }
-} 
+}
+
+// Convoy join dialog
+class ConvoyJoinDialog extends StatelessWidget {
+  final TextEditingController controller;
+  final VoidCallback onJoin;
+
+  const ConvoyJoinDialog({
+    super.key,
+    required this.controller,
+    required this.onJoin,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Join Convoy'),
+      content: TextField(
+        controller: controller,
+        decoration: const InputDecoration(
+          labelText: 'Convoy ID',
+          hintText: 'Enter convoy ID',
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            onJoin();
+            Navigator.of(context).pop();
+          },
+          child: const Text('Join'),
+        ),
+      ],
+    );
+  }
+}
+
+ 
