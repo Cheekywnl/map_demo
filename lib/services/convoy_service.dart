@@ -2,17 +2,16 @@ import 'dart:convert';
 import 'dart:async';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:latlong2/latlong.dart';
 
 class ConvoyLocation {
   final String userId;
-  final LatLng coordinates;
+  final List<double> coordinates;
   final double velocity;
   final double heading;
   final DateTime timestamp;
   final double accuracy;
   final bool isOnJourney;
-  final List<LatLng>? routePoints;
+  final List<List<double>>? routePoints;
 
   ConvoyLocation({
     required this.userId,
@@ -26,19 +25,16 @@ class ConvoyLocation {
   });
 
   factory ConvoyLocation.fromJson(Map<String, dynamic> json) {
-    List<LatLng>? routePoints;
+    List<List<double>>? routePoints;
     if (json['routePoints'] != null) {
       routePoints = (json['routePoints'] as List)
-          .map((point) => LatLng(point[1].toDouble(), point[0].toDouble()))
+          .map((point) => List<double>.from((point as List).map((v) => v.toDouble())))
           .toList();
     }
 
     return ConvoyLocation(
       userId: json['userId'],
-      coordinates: LatLng(
-        json['coordinates'][1].toDouble(),
-        json['coordinates'][0].toDouble(),
-      ),
+      coordinates: List<double>.from((json['coordinates'] as List).map((v) => v.toDouble())),
       velocity: json['velocity']?.toDouble() ?? 0.0,
       heading: json['heading']?.toDouble() ?? 0.0,
       timestamp: DateTime.fromMillisecondsSinceEpoch(json['timestamp']),
@@ -253,7 +249,7 @@ class ConvoyService {
             final location = ConvoyLocation.fromJson(loc);
             _memberLocations[location.userId] = location;
             _locationController.add(location);
-            print('🟣 Added location for ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}]');
+            print('🟣 Added location for ${location.userId}: [${location.coordinates[1].toStringAsFixed(6)}, ${location.coordinates[0].toStringAsFixed(6)}]');
           }
           break;
 
@@ -289,7 +285,7 @@ class ConvoyService {
     _memberLocations[location.userId] = location;
     _locationController.add(location);
     
-    print('📍 Location update from ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}]');
+    print('📍 Location update from ${location.userId}: [${location.coordinates[1].toStringAsFixed(6)}, ${location.coordinates[0].toStringAsFixed(6)}]');
   }
 
   // Dispose resources

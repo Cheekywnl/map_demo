@@ -38,6 +38,7 @@ dependencies:
   geolocator: ^10.1.0
   http: ^1.1.0
   web_socket_channel: ^2.4.0
+  mapbox_maps_flutter: ^2.9.0
 
 dev_dependencies:
   flutter_test:

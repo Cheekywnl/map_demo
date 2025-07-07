@@ -16,7 +16,7 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.blue,
         useMaterial3: true,
       ),
-      home: const MapWidget(), // TODO: Add navigation to FriendsWidget in the future
+      home: const MapScreen(), // TODO: Add navigation to FriendsWidget in the future
     );
   }
 }

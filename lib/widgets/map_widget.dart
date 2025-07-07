@@ -1,247 +1,116 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
-import 'dart:convert';
-import 'dart:async';
+import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
 import '../services/convoy_service.dart';
 import '../services/dummy_user_service.dart';
-import 'package:collection/collection.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:flutter/services.dart';
+import '../services/location_service.dart';
+import 'package:geolocator/geolocator.dart';
 
-class SearchResult {
-  final String name;
-  final String address;
-  final LatLng coordinates;
-
-  SearchResult({
-    required this.name,
-    required this.address,
-    required this.coordinates,
-  });
-}
-
-class RouteInfo {
-  final double distance; // in kilometers
-  final int duration; // in seconds
-  final String distanceText;
-  final String durationText;
-
-  RouteInfo({
-    required this.distance,
-    required this.duration,
-    required this.distanceText,
-    required this.durationText,
-  });
-}
-
-class MapWidget extends StatefulWidget {
-  const MapWidget({super.key});
+class MapScreen extends StatefulWidget {
+  const MapScreen({Key? key}) : super(key: key);
 
   @override
-  State<MapWidget> createState() => _MapWidgetState();
+  State<MapScreen> createState() => _MapScreenState();
 }
 
-class _MapWidgetState extends State<MapWidget> {
-  final MapController _mapController = MapController();
-  Position? _currentPosition;
-  List<LatLng> _routePoints = [];
-  bool _isLoadingRoute = false;
-  RouteInfo? _routeInfo;
+class _MapScreenState extends State<MapScreen> {
+  MapboxMap? mapboxMap;
+  PointAnnotationManager? pointAnnotationManager;
+  PolylineAnnotationManager? polylineAnnotationManager;
+  static const String _accessToken = 'pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg';
+
+  final ConvoyService _convoyService = ConvoyService();
+  DummyUserService? _dummyUserService;
+
+  // Search bar state
   final TextEditingController _searchController = TextEditingController();
-  List<SearchResult> _searchResults = [];
+  List<Map<String, dynamic>> _searchResults = [];
   bool _isSearching = false;
   bool _showSearchResults = false;
-  SearchResult? _selectedDestination;
   Timer? _searchDebounce;
-  bool _isMapReady = false;
+  Map<String, dynamic>? _selectedDestination;
 
-  // Convoy functionality
-  final ConvoyService _convoyService = ConvoyService();
+  // Convoy state
   bool _isInConvoy = false;
   String _currentConvoyId = '';
-  final Map<String, Marker> _convoyMarkers = {};
-  final TextEditingController _convoyIdController = TextEditingController();
   bool _showConvoyDialog = false;
+  final TextEditingController _convoyIdController = TextEditingController();
 
-  // Dummy user functionality
-  DummyUserService? _dummyUserService;
+  // Dummy user state
   bool _isDummyUserActive = false;
-  final Map<String, List<LatLng>> _memberRoutes = {};
+
+  // Route info
+  String? _routeDistance;
+  String? _routeDuration;
+
+  // Add this field to the state:
+  List<PolylineAnnotation> _searchRoutePolylines = [];
+
+  // Follow mode state
+  bool _followMe = true;
+
+  StreamSubscription<Position>? _deviceLocationSub;
 
   @override
   void initState() {
     super.initState();
-    _getCurrentLocation();
-    _setupConvoyListeners();
+    MapboxOptions.setAccessToken(_accessToken);
+    _convoyService.locationUpdates.listen(_onConvoyLocationUpdate);
+    _startDeviceLocationFollow();
   }
 
-  @override
-  void dispose() {
-    _searchController.dispose();
-    _searchDebounce?.cancel();
-    _convoyIdController.dispose();
-    _convoyService.dispose();
-    _dummyUserService?.dispose();
-    super.dispose();
+  void _onMapCreated(MapboxMap mapboxMap) async {
+    this.mapboxMap = mapboxMap;
+    pointAnnotationManager = await mapboxMap.annotations.createPointAnnotationManager();
+    polylineAnnotationManager = await mapboxMap.annotations.createPolylineAnnotationManager();
+    _showAllConvoyMembers();
+    mapboxMap.location.updateSettings(LocationComponentSettings(
+      enabled: true,
+      pulsingEnabled: true,
+    ));
   }
 
-  void _setupConvoyListeners() {
-    // Listen for convoy member location updates
-    _convoyService.locationUpdates.listen((location) {
-      bool markerChanged = false;
-      bool routeChanged = false;
-      // Only update marker if position changed
-      if (!_convoyMarkers.containsKey(location.userId) ||
-          _convoyMarkers[location.userId]!.point != location.coordinates) {
-        _convoyMarkers[location.userId] = Marker(
-          point: location.coordinates,
-          width: 40,
-          height: 40,
-          child: Container(
-            decoration: BoxDecoration(
-              color: location.userId == _convoyService.userId
-                  ? Colors.blue.withOpacity(0.8)
-                  : (location.userId.startsWith('dummy_')
-                      ? Colors.purple.withOpacity(0.8)
-                      : Colors.orange.withOpacity(0.8)),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 2),
-            ),
-            child: Icon(
-              location.isOnJourney ? Icons.directions_car : Icons.person,
-              color: Colors.white,
-              size: 20,
-            ),
+  Future<Uint8List> _loadAssetImage(String path) async {
+    final byteData = await rootBundle.load(path);
+    return byteData.buffer.asUint8List();
+  }
+
+  void _onConvoyLocationUpdate(ConvoyLocation location) async {
+    if (pointAnnotationManager == null || polylineAnnotationManager == null) return;
+    await pointAnnotationManager!.deleteAll();
+    for (final member in _convoyService.memberLocations.values) {
+      Uint8List? customImage;
+      if (member.userId.startsWith('dummy_')) {
+        customImage = await _loadAssetImage('assets/user_marker.png');
+      }
+      await pointAnnotationManager!.create(PointAnnotationOptions(
+        geometry: Point(coordinates: Position(member.coordinates[0], member.coordinates[1])),
+        image: customImage,
+        iconSize: member.userId.startsWith('dummy_') ? 0.5 : 1.5,
+      ));
+      if (member.routePoints != null && member.routePoints!.isNotEmpty) {
+        await polylineAnnotationManager!.create(PolylineAnnotationOptions(
+          geometry: LineString(
+            coordinates: member.routePoints!.map((p) => Position(p[0], p[1])).toList(),
           ),
-        );
-        markerChanged = true;
+          lineColor: member.userId.startsWith('dummy_') ? 0xFF800080 : 0xFF008000,
+          lineWidth: 4.0,
+        ));
       }
-      // Only update route if changed
-      if (location.routePoints != null && location.routePoints!.isNotEmpty) {
-        final prevRoute = _memberRoutes[location.userId];
-        final newRoute = location.routePoints!;
-        if (prevRoute == null || prevRoute.length != newRoute.length ||
-            !ListEquality().equals(prevRoute, newRoute)) {
-          _memberRoutes[location.userId] = newRoute;
-          routeChanged = true;
-        }
-      }
-      if (markerChanged || routeChanged) {
-        setState(() {});
-      }
-      // Fallback: check if dummy user marker is missing after update
-      if (location.userId.startsWith('dummy_') && !_convoyMarkers.containsKey(location.userId)) {
-        print('❗ Dummy user marker NOT added for ${location.userId}');
-      }
-      print('📍 Location update from ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}] - Journey: ${location.isOnJourney}');
-      if (location.userId.startsWith('dummy_') && _convoyMarkers.length <= 2) {
-        print('🗺️ Centering map on dummy user location');
-        _animatedMapMove(location.coordinates, 15.0);
-      }
-    });
-
-    // Listen for member joined
-    _convoyService.memberJoined.listen((userId) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('👥 $userId joined the convoy')),
-      );
-    });
-
-    // Listen for member left
-    _convoyService.memberLeft.listen((userId) {
-      setState(() {
-        _convoyMarkers.remove(userId);
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('👋 $userId left the convoy')),
-      );
-    });
-
-    // Listen for connection status
-    _convoyService.connectionStatus.listen((status) {
-      print('🔌 Connection status: $status');
-      if (status == 'connected') {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('✅ Connected to convoy server')),
-        );
-      } else if (status == 'error') {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('❌ Failed to connect to convoy server')),
-        );
-      }
-    });
-  }
-
-  Future<void> _getCurrentLocation() async {
-    print('📍 Getting current location...');
-    try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        print('❌ Location services are disabled');
-        return;
-      }
-      print('✅ Location services are enabled');
-      
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        print('🔐 Requesting location permission...');
-        permission = await Geolocator.requestPermission();
-        if (permission == LocationPermission.denied) {
-          print('❌ Location permission denied');
-          return;
-        }
-      }
-      if (permission == LocationPermission.deniedForever) {
-        print('❌ Location permission denied forever');
-        return;
-      }
-      print('✅ Location permission granted');
-      
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-      print('📍 Current position: ${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}');
-      setState(() {
-        _currentPosition = position;
-      });
-      if (_isMapReady) {
-        _animatedMapMove(LatLng(position.latitude, position.longitude), 20.0);
-      }
-    } catch (e) {
-      print('❌ Error getting location: $e');
+      // Do NOT move camera here; follow mode is handled by device location
     }
   }
 
-  void _centerOnLocation() {
-    if (_currentPosition != null && _isMapReady) {
-      print('📍 Centering map on current location');
-      _animatedMapMove(LatLng(_currentPosition!.latitude, _currentPosition!.longitude), 20.0);
+  void _showAllConvoyMembers() {
+    for (final member in _convoyService.memberLocations.values) {
+      _onConvoyLocationUpdate(member);
     }
   }
 
-  void _centerOnDummyUser() {
-    // Find the first dummy user marker
-    final dummyUserEntry = _convoyMarkers.entries
-        .where((entry) => entry.key.startsWith('dummy_'))
-        .firstOrNull;
-    
-    if (dummyUserEntry != null && _isMapReady) {
-      print('🚗 Centering map on dummy user');
-      _animatedMapMove(dummyUserEntry.value.point, 15.0);
-    } else {
-      print('❌ No dummy user found on map');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('❌ No dummy user found on map')),
-      );
-    }
-  }
-
-  void _animatedMapMove(LatLng dest, double zoom) {
-    print('🗺️ Moving map to: ${dest.latitude.toStringAsFixed(6)}, ${dest.longitude.toStringAsFixed(6)} at zoom level: ${zoom.toStringAsFixed(1)}');
-    _mapController.move(dest, zoom);
-  }
-
+  // --- Search logic ---
   void _onSearchChanged(String query) {
     _searchDebounce?.cancel();
     if (query.isEmpty) {
@@ -249,46 +118,39 @@ class _MapWidgetState extends State<MapWidget> {
         _searchResults = [];
         _showSearchResults = false;
       });
-      print('🔍 Search cleared');
       return;
     }
-    print('🔍 Search query: "$query"');
     _searchDebounce = Timer(const Duration(milliseconds: 500), () {
       _searchPlaces(query);
     });
   }
 
+  void _onSearchSubmitted(String query) {
+    if (_searchResults.isNotEmpty) {
+      _selectPlace(_searchResults[0]);
+    }
+  }
+
   Future<void> _searchPlaces(String query) async {
     if (query.isEmpty) return;
-    print('🌍 Searching for: "$query"');
     setState(() {
       _isSearching = true;
     });
     try {
-      const String accessToken = 'pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg';
-      final String url = 
+      final String url =
           'https://api.mapbox.com/geocoding/v5/mapbox.places/$query.json'
-          '?access_token=$accessToken'
-          '&limit=5'
-          '&types=poi,address';
-      final response = await http.get(Uri.parse(url)).timeout(
-        const Duration(seconds: 10),
-      );
+          '?access_token=$_accessToken&limit=5&types=poi,address';
+      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         final List<dynamic> features = data['features'];
-        print('✅ Found ${features.length} search results');
         setState(() {
-          _searchResults = features.map((feature) => SearchResult(
-            name: feature['place_name'],
-            address: feature['place_name'],
-            coordinates: LatLng(feature['center'][1], feature['center'][0]),
-          )).toList();
+          _searchResults = features.cast<Map<String, dynamic>>();
           _showSearchResults = true;
         });
       }
     } catch (e) {
-      print('❌ Error searching places: $e');
+      // ignore
     } finally {
       setState(() {
         _isSearching = false;
@@ -296,104 +158,92 @@ class _MapWidgetState extends State<MapWidget> {
     }
   }
 
-  void _selectPlace(SearchResult place) {
-    print('🎯 Selected place: "${place.name}" at ${place.coordinates.latitude.toStringAsFixed(6)}, ${place.coordinates.longitude.toStringAsFixed(6)}');
+  void _selectPlace(Map<String, dynamic> place) async {
     setState(() {
       _showSearchResults = false;
-      _searchController.text = place.name;
+      _searchController.text = place['place_name'] ?? '';
+      _selectedDestination = place;
     });
-    _animatedMapMove(place.coordinates, 18.0);
-    _getRoute(place.coordinates);
+    FocusScope.of(context).unfocus(); // Dismiss keyboard
+    _moveCameraTo(place['center'][0], place['center'][1], 16.0);
+    await _getRoute(place['center'][0], place['center'][1]);
   }
 
-  Future<void> _getRoute(LatLng destination) async {
-    if (_currentPosition == null) return;
-    print('🛣️ Getting route to: ${destination.latitude.toStringAsFixed(6)}, ${destination.longitude.toStringAsFixed(6)}');
+  void _clearSearch() {
     setState(() {
-      _isLoadingRoute = true;
-      _routeInfo = null;
+      _searchController.clear();
+      _searchResults = [];
+      _showSearchResults = false;
+    });
+    FocusScope.of(context).unfocus();
+  }
+
+  // --- Route logic ---
+  Future<void> _getRoute(double lon, double lat) async {
+    setState(() {
+      _routeDistance = null;
+      _routeDuration = null;
     });
     try {
-      const String accessToken = 'pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg';
-      final LatLng origin = LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
-      final String url = 
+      final location = await LocationService().getCurrentLocation();
+      final double startLon = location['lng'] ?? -0.1263;
+      final double startLat = location['lat'] ?? 51.5344;
+      final String url =
           'https://api.mapbox.com/directions/v5/mapbox/driving/'
-          '${origin.longitude},${origin.latitude};'
-          '${destination.longitude},${destination.latitude}'
-          '?geometries=geojson&overview=full&steps=true&annotations=distance,duration,speed&access_token=$accessToken';
-      final response = await http.get(Uri.parse(url)).timeout(
-        const Duration(seconds: 15),
-      );
+          '$startLon,$startLat;$lon,$lat'
+          '?geometries=geojson&overview=full&steps=true&access_token=$_accessToken';
+      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['routes'] != null && data['routes'].isNotEmpty) {
           final route = data['routes'][0];
-          final List<dynamic> coordinates = route['geometry']['coordinates'];
-          final double distance = route['distance'] / 1000; // Convert to km
-          final int duration = route['duration'].round(); // Duration in seconds
-          final String distanceText = distance >= 1 
-              ? '${distance.toStringAsFixed(1)} km'
-              : '${(distance * 1000).round()} m';
-          final String durationText = _formatDuration(duration);
-          print('✅ Route calculated: $distanceText, $durationText (${coordinates.length} points)');
-          setState(() {
-            _routePoints = coordinates.map((coord) => 
-                LatLng(coord[1].toDouble(), coord[0].toDouble())).toList();
-            _routeInfo = RouteInfo(
-              distance: distance,
-              duration: duration,
-              distanceText: distanceText,
-              durationText: durationText,
-            );
-          });
-          // Send route points to server as part of a location update
-          if (_isInConvoy && _currentPosition != null) {
-            final locationData = {
-              'type': 'location_update',
-              'coordinates': [
-                _currentPosition!.longitude,
-                _currentPosition!.latitude
-              ],
-              'velocity': 0.0,
-              'heading': 0.0,
-              'timestamp': DateTime.now().millisecondsSinceEpoch,
-              'accuracy': _currentPosition!.accuracy,
-              'isOnJourney': true,
-              'routePoints': coordinates,
-            };
-            _convoyService.sendLocationUpdate(locationData);
+          final double distance = route['distance'] / 1000;
+          final int duration = route['duration'].round();
+          // Draw each step as a separate polyline
+          List<List<double>> allRoutePoints = [];
+          if (polylineAnnotationManager != null) {
+            // Delete previous polylines
+            await polylineAnnotationManager!.deleteAll();
+            _searchRoutePolylines.clear();
+            final steps = route['legs'][0]['steps'] as List<dynamic>;
+            for (final step in steps) {
+              final List<dynamic> coords = step['geometry']['coordinates'];
+              final List<Position> positions = coords.map<Position>((c) => Position(c[0].toDouble(), c[1].toDouble())).toList();
+              final polyline = await polylineAnnotationManager!.create(PolylineAnnotationOptions(
+                geometry: LineString(coordinates: positions),
+                lineColor: 0xFF0000FF,
+                lineWidth: 4.0,
+                lineOpacity: 0.9,
+              ));
+              _searchRoutePolylines.add(polyline);
+              // Add to allRoutePoints for server
+              allRoutePoints.addAll(coords.map<List<double>>((c) => [c[0].toDouble(), c[1].toDouble()]));
+            }
           }
+          // Send route to server if in convoy
+          if (_isInConvoy && allRoutePoints.isNotEmpty) {
+            final routeMessage = {
+              'type': 'route_update',
+              'routePoints': allRoutePoints,
+            };
+            _convoyService.sendLocationUpdate(routeMessage);
+          }
+          setState(() {
+            _routeDistance = distance >= 1 ? '${distance.toStringAsFixed(1)} km' : '${(distance * 1000).round()} m';
+            _routeDuration = duration < 60 ? '$duration sec' : '${(duration / 60).round()} min';
+          });
         }
       }
     } catch (e) {
-      print('❌ Error getting route: $e');
-    } finally {
-      setState(() {
-        _isLoadingRoute = false;
-      });
+      print('Route error: $e');
     }
   }
 
-  String _formatDuration(int seconds) {
-    if (seconds < 60) {
-      return '$seconds sec';
-    } else if (seconds < 3600) {
-      final minutes = (seconds / 60).round();
-      return '$minutes min';
-    } else {
-      final hours = (seconds / 3600).floor();
-      final minutes = ((seconds % 3600) / 60).round();
-      return '$hours hr $minutes min';
-    }
-  }
-
-  // Convoy functions
+  // --- Convoy logic ---
   void _showConvoyJoinDialog() {
-    print('🔧 Showing convoy join dialog...');
     setState(() {
       _showConvoyDialog = true;
     });
-    
     showDialog(
       context: context,
       builder: (BuildContext context) {
@@ -408,15 +258,11 @@ class _MapWidgetState extends State<MapWidget> {
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                print('❌ Convoy join cancelled');
-                Navigator.of(context).pop();
-              },
+              onPressed: () => Navigator.of(context).pop(),
               child: const Text('Cancel'),
             ),
             ElevatedButton(
               onPressed: () {
-                print('✅ Convoy join button pressed');
                 _joinConvoy();
                 Navigator.of(context).pop();
               },
@@ -430,42 +276,19 @@ class _MapWidgetState extends State<MapWidget> {
 
   void _joinConvoy() {
     final convoyId = _convoyIdController.text.trim();
-    print('🔧 Attempting to join convoy: "$convoyId"');
-    
-    if (convoyId.isEmpty) {
-      print('❌ Convoy ID is empty');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('❌ Please enter a convoy ID')),
-      );
-      return;
-    }
-
-    print('🔌 Connecting to convoy server with ID: $convoyId');
+    if (convoyId.isEmpty) return;
     _convoyService.connect('user_${DateTime.now().millisecondsSinceEpoch}', convoyId: convoyId).then((success) {
-      print('🔌 Connection result: $success');
       if (success) {
         setState(() {
           _isInConvoy = true;
           _currentConvoyId = convoyId;
-          _showConvoyDialog = false;
+          _followMe = true; // Enable follow by default
         });
-        print('📍 Starting location tracking...');
         _convoyService.startLocationTracking();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('🚗 Joined convoy: $convoyId')),
-        );
-        print('✅ Successfully joined convoy: $convoyId');
-      } else {
-        print('❌ Failed to join convoy');
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('❌ Failed to connect to convoy server')),
+          SnackBar(content: Text('Joined convoy $convoyId!')),
         );
       }
-    }).catchError((error) {
-      print('❌ Error joining convoy: $error');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('❌ Error: $error')),
-      );
     });
   }
 
@@ -475,23 +298,12 @@ class _MapWidgetState extends State<MapWidget> {
     setState(() {
       _isInConvoy = false;
       _currentConvoyId = '';
-      _convoyMarkers.clear();
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('👋 Left convoy')),
-    );
   }
 
   void _startDummyUser() async {
-    if (_currentConvoyId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('❌ Please join a convoy first')),
-      );
-      return;
-    }
-
+    if (_currentConvoyId.isEmpty) return;
     final dummyUserId = 'dummy_${DateTime.now().millisecondsSinceEpoch}';
-    // Create a NEW ConvoyService for the dummy user!
     final dummyConvoyService = ConvoyService();
     final success = await dummyConvoyService.connect(dummyUserId, convoyId: _currentConvoyId);
     if (success) {
@@ -500,15 +312,6 @@ class _MapWidgetState extends State<MapWidget> {
       setState(() {
         _isDummyUserActive = true;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('🚗 Started dummy user: $dummyUserId')),
-      );
-      print('🚗 Dummy user started: $dummyUserId in convoy: $_currentConvoyId');
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('❌ Failed to connect dummy user to convoy server')),
-      );
-      print('❌ Failed to connect dummy user to convoy server');
     }
   }
 
@@ -516,163 +319,76 @@ class _MapWidgetState extends State<MapWidget> {
     _dummyUserService?.stopDummyUser();
     _dummyUserService?.dispose();
     _dummyUserService = null;
-    
     setState(() {
       _isDummyUserActive = false;
     });
-    
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('🛑 Stopped dummy user')),
+  }
+
+  void _moveCameraTo(double lon, double lat, double zoom) {
+    mapboxMap?.flyTo(
+      CameraOptions(center: Point(coordinates: Position(lon, lat)), zoom: zoom),
+      MapAnimationOptions(duration: 1000),
     );
-    print('🛑 Dummy user stopped');
+  }
+
+  // Add a method to clear the route
+  void _clearRoute() async {
+    if (polylineAnnotationManager != null) {
+      await polylineAnnotationManager!.deleteAll();
+      _searchRoutePolylines.clear();
+    }
+    setState(() {
+      _routeDistance = null;
+      _routeDuration = null;
+      _selectedDestination = null;
+    });
+  }
+
+  void _startDeviceLocationFollow() {
+    _deviceLocationSub?.cancel();
+    _deviceLocationSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 2),
+    ).listen((position) {
+      if (_followMe) {
+        _moveCameraTo(position.longitude, position.latitude, mapboxMap != null ? mapboxMap!.getCameraState().then((c) => c.zoom).catchError((_) => 15.0) : 15.0);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    print('🟢 [build] Rendering markers: ${_convoyMarkers.keys}');
-    if (_currentPosition == null) {
-      return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(),
-        ),
-      );
-    }
-    return Scaffold(
-      body: Stack(
-        children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-              initialZoom: 13.0,
-              maxZoom: 18.0,
-              minZoom: 3.0,
-              onMapReady: () {
-                print('🗺️ Map is ready!');
-                setState(() {
-                  _isMapReady = true;
-                });
-              },
+    return GestureDetector(
+      onTap: () {
+        if (_showSearchResults) {
+          setState(() {
+            _showSearchResults = false;
+          });
+          FocusScope.of(context).unfocus();
+        }
+      },
+      child: Scaffold(
+        body: Stack(
+          children: [
+            MapWidget(
+              key: const ValueKey("mapWidget"),
+              onMapCreated: _onMapCreated,
+              cameraOptions: CameraOptions(
+                center: Point(coordinates: Position(-0.1263, 51.5344)),
+                zoom: 13.0,
+              ),
+              styleUri: MapboxStyles.LIGHT,
             ),
-            children: [
-              TileLayer(
-                urlTemplate: 'https://api.mapbox.com/styles/v1/mapbox/light-v11/tiles/{z}/{x}/{y}?access_token=pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg',
-                userAgentPackageName: 'com.example.map_here_demo',
-                maxZoom: 18,
-              ),
-              MarkerLayer(
-                markers: [
-                  Marker(
-                    point: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-                    width: 40,
-                    height: 40,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: Colors.blue,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 2),
-                      ),
-                      child: const Icon(Icons.my_location, color: Colors.white, size: 20),
-                    ),
-                  ),
-                  ..._convoyMarkers.values,
-                ],
-              ),
-              // Route polyline
-              if (_routePoints.isNotEmpty)
-                PolylineLayer(
-                  polylines: [
-                    Polyline(
-                      points: _routePoints,
-                      strokeWidth: 4,
-                      color: Colors.blue,
-                    ),
-                  ],
-                ),
-              // Convoy member routes
-              if (_memberRoutes.isNotEmpty)
-                PolylineLayer(
-                  polylines: _memberRoutes.entries.map((entry) {
-                    final userId = entry.key;
-                    final routePoints = entry.value;
-                    final isDummyUser = userId.startsWith('dummy_');
-                    
-                    return Polyline(
-                      points: routePoints,
-                      strokeWidth: 3,
-                      color: isDummyUser ? Colors.purple : Colors.green,
-                    );
-                  }).toList(),
-                ),
-              if (_routePoints.isNotEmpty)
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: _routePoints.last,
-                      width: 30,
-                      height: 30,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.red.withOpacity(0.8),
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white, width: 2),
-                        ),
-                        child: const Icon(
-                          Icons.location_on,
-                          color: Colors.white,
-                          size: 16,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-            ],
-          ),
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 10,
-            left: 10,
-            right: 10,
-            child: Column(
-              children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(25),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
-                        blurRadius: 10,
-                        offset: const Offset(0, 2),
-                      ),
-                    ],
-                  ),
-                  child: TextField(
-                    controller: _searchController,
-                    onChanged: _onSearchChanged,
-                    decoration: InputDecoration(
-                      hintText: 'Search destination...',
-                      prefixIcon: const Icon(Icons.search),
-                      suffixIcon: _isSearching
-                          ? const Padding(
-                              padding: EdgeInsets.all(12),
-                              child: SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              ),
-                            )
-                          : null,
-                      border: InputBorder.none,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
-                    ),
-                  ),
-                ),
-                if (_showSearchResults)
+            // Search bar overlay
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 10,
+              left: 10,
+              right: 10,
+              child: Column(
+                children: [
                   Container(
-                    margin: const EdgeInsets.only(top: 5),
                     decoration: BoxDecoration(
                       color: Colors.white,
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(25),
                       boxShadow: [
                         BoxShadow(
                           color: Colors.black.withOpacity(0.1),
@@ -681,184 +397,174 @@ class _MapWidgetState extends State<MapWidget> {
                         ),
                       ],
                     ),
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: _searchResults.length,
-                      itemBuilder: (context, index) {
-                        final result = _searchResults[index];
-                        return ListTile(
-                          title: Text(result.name),
-                          subtitle: Text(result.address),
-                          onTap: () => _selectPlace(result),
-                        );
-                      },
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _searchController,
+                            onChanged: _onSearchChanged,
+                            onSubmitted: _onSearchSubmitted,
+                            textInputAction: TextInputAction.search,
+                            decoration: InputDecoration(
+                              hintText: 'Search destination...',
+                              prefixIcon: const Icon(Icons.search),
+                              suffixIcon: _searchController.text.isNotEmpty
+                                  ? IconButton(
+                                      icon: const Icon(Icons.clear),
+                                      onPressed: _clearSearch,
+                                    )
+                                  : null,
+                              border: InputBorder.none,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-              ],
+                  if (_showSearchResults)
+                    Container(
+                      margin: const EdgeInsets.only(top: 5),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.1),
+                            blurRadius: 10,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _searchResults.length,
+                        itemBuilder: (context, index) {
+                          final result = _searchResults[index];
+                          return ListTile(
+                            title: Text(result['place_name'] ?? ''),
+                            subtitle: Text(result['address'] ?? ''),
+                            onTap: () => _selectPlace(result),
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ),
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 80,
-            right: 10,
-            child: Column(
-              children: [
-                FloatingActionButton.small(
-                  onPressed: _isInConvoy ? _leaveConvoy : _showConvoyJoinDialog,
-                  backgroundColor: _isInConvoy ? Colors.red : Colors.green,
-                  child: Icon(
-                    _isInConvoy ? Icons.exit_to_app : Icons.group,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                if (_isInConvoy)
+            // Convoy and dummy user controls
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 80,
+              right: 10,
+              child: Column(
+                children: [
                   FloatingActionButton.small(
-                    onPressed: _isDummyUserActive ? _stopDummyUser : _startDummyUser,
-                    backgroundColor: _isDummyUserActive ? Colors.orange : Colors.purple,
+                    onPressed: _isInConvoy ? _leaveConvoy : _showConvoyJoinDialog,
+                    backgroundColor: _isInConvoy ? Colors.red : Colors.green,
                     child: Icon(
-                      _isDummyUserActive ? Icons.stop : Icons.directions_car,
+                      _isInConvoy ? Icons.exit_to_app : Icons.group,
                       color: Colors.white,
                     ),
                   ),
-                if (_isInConvoy) const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  onPressed: _centerOnLocation,
-                  backgroundColor: Colors.white,
-                  child: const Icon(Icons.my_location, color: Colors.black87),
-                ),
-                if (_isDummyUserActive) const SizedBox(height: 8),
-                if (_isDummyUserActive)
-                  FloatingActionButton.small(
-                    onPressed: _centerOnDummyUser,
-                    backgroundColor: Colors.purple,
-                    child: const Icon(Icons.directions_car, color: Colors.white),
-                  ),
-              ],
-            ),
-          ),
-          if (_routeInfo != null)
-            Positioned(
-              bottom: MediaQuery.of(context).padding.bottom + 20,
-              left: 20,
-              right: 20,
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.1),
-                      blurRadius: 10,
-                      offset: const Offset(0, 2),
+                  const SizedBox(height: 8),
+                  if (_isInConvoy)
+                    FloatingActionButton.small(
+                      onPressed: _isDummyUserActive ? _stopDummyUser : _startDummyUser,
+                      backgroundColor: _isDummyUserActive ? Colors.orange : Colors.purple,
+                      child: Icon(
+                        _isDummyUserActive ? Icons.stop : Icons.directions_car,
+                        color: Colors.white,
+                      ),
                     ),
-                  ],
-                ),
+                ],
+              ),
+            ),
+            // Route info card
+            if (_routeDistance != null && _routeDuration != null)
+              Positioned(
+                bottom: MediaQuery.of(context).padding.bottom + 20,
+                left: 20,
+                right: 20,
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      'Route to ${_selectedDestination?.name ?? 'Destination'}',
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.1),
+                            blurRadius: 10,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Route to ${_selectedDestination?['place_name'] ?? 'Destination'}',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Icon(Icons.directions_car, color: Colors.blue, size: 20),
+                              const SizedBox(width: 8),
+                              Text('$_routeDistance • $_routeDuration'),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Icon(Icons.directions_car, color: Colors.blue, size: 20),
-                        const SizedBox(width: 8),
-                        Text('${_routeInfo!.distanceText} • ${_routeInfo!.durationText}'),
-                      ],
+                    ElevatedButton.icon(
+                      onPressed: _clearRoute,
+                      icon: Icon(Icons.cancel),
+                      label: Text('Cancel Route'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
                     ),
                   ],
                 ),
               ),
-            ),
-          if (_isInConvoy)
+            // Follow mode toggle button
             Positioned(
-              top: MediaQuery.of(context).padding.top + 10,
-              right: 10,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.9),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Text(
-                  '🚗 Convoy: $_currentConvoyId',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
+              bottom: MediaQuery.of(context).padding.bottom + 90,
+              right: 20,
+              child: FloatingActionButton.small(
+                onPressed: () {
+                  setState(() {
+                    _followMe = !_followMe;
+                  });
+                },
+                backgroundColor: _followMe ? Colors.blue : Colors.grey,
+                child: Icon(_followMe ? Icons.my_location : Icons.location_disabled, color: Colors.white),
               ),
             ),
-          if (_isDummyUserActive)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 10,
-              right: 10,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.9),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                                  child: const Text(
-                    '🚗 Dummy User Active',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-              ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
-}
-
-// Convoy join dialog
-class ConvoyJoinDialog extends StatelessWidget {
-  final TextEditingController controller;
-  final VoidCallback onJoin;
-
-  const ConvoyJoinDialog({
-    super.key,
-    required this.controller,
-    required this.onJoin,
-  });
 
   @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Join Convoy'),
-      content: TextField(
-        controller: controller,
-        decoration: const InputDecoration(
-          labelText: 'Convoy ID',
-          hintText: 'Enter convoy ID',
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-        ElevatedButton(
-          onPressed: () {
-            onJoin();
-            Navigator.of(context).pop();
-          },
-          child: const Text('Join'),
-        ),
-      ],
-    );
+  void dispose() {
+    _deviceLocationSub?.cancel();
+    _searchController.dispose();
+    _searchDebounce?.cancel();
+    _convoyService.dispose();
+    _dummyUserService?.dispose();
+    _convoyIdController.dispose();
+    super.dispose();
   }
 }
 

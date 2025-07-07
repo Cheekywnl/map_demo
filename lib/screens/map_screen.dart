@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../services/location_service.dart';
-import '../widgets/custom_map.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});

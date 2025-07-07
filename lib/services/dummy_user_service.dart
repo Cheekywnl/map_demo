@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:math';
-import 'package:latlong2/latlong.dart';
 import 'convoy_service.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 
 class DummyUserService {
   Timer? _movementTimer;
@@ -10,21 +11,22 @@ class DummyUserService {
   final String _convoyId;
   
   // London route coordinates (from Kings Cross to Camden)
-  final List<LatLng> _routePoints = [
-    LatLng(51.5320, -0.1233), // Kings Cross Station
-    LatLng(51.5335, -0.1250), // York Way
-    LatLng(51.5350, -0.1270), // Caledonian Road
-    LatLng(51.5370, -0.1300), // Camden Road
-    LatLng(51.5390, -0.1350), // Camden High Street
-    LatLng(51.5410, -0.1400), // Camden Town
-    LatLng(51.5420, -0.1450), // Chalk Farm
-    LatLng(51.5430, -0.1500), // Belsize Park
-    LatLng(51.5440, -0.1550), // Hampstead
-    LatLng(51.5450, -0.1600), // Hampstead Heath
+  final List<List<double>> _routePoints = [
+    [51.5320, -0.1233], // Kings Cross Station
+    [51.5335, -0.1250], // York Way
+    [51.5350, -0.1270], // Caledonian Road
+    [51.5370, -0.1300], // Camden Road
+    [51.5390, -0.1350], // Camden High Street
+    [51.5410, -0.1400], // Camden Town
+    [51.5420, -0.1450], // Chalk Farm
+    [51.5430, -0.1500], // Belsize Park
+    [51.5440, -0.1550], // Hampstead
+    [51.5450, -0.1600], // Hampstead Heath
   ];
   
-  int _currentRouteIndex = 0;
-  double _progressAlongSegment = 0.0;
+  List<List<double>> _routePolyline = [];
+  int _currentPolylineIndex = 0;
+  double _progressAlongPolyline = 0.0;
   double _currentSpeed = 0.0; // m/s
   double _currentHeading = 0.0;
   bool _isOnJourney = true;
@@ -36,18 +38,41 @@ class DummyUserService {
   
   DummyUserService(this._convoyService, this._userId, this._convoyId);
   
+  Future<void> _fetchRoutePolyline() async {
+    // Kings Cross to Hampstead Heath
+    final start = _routePoints.first;
+    final end = _routePoints.last;
+    final accessToken = 'pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg';
+    final url =
+        'https://api.mapbox.com/directions/v5/mapbox/driving/${start[1]},${start[0]};${end[1]},${end[0]}'
+        '?geometries=geojson&overview=full&steps=true&access_token=$accessToken';
+    final response = await http.get(Uri.parse(url));
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      if (data['routes'] != null && data['routes'].isNotEmpty) {
+        final route = data['routes'][0];
+        final coords = route['geometry']['coordinates'] as List<dynamic>;
+        _routePolyline = coords.map<List<double>>((c) => [c[0].toDouble(), c[1].toDouble()]).toList();
+        _currentPolylineIndex = 0;
+        _progressAlongPolyline = 0.0;
+      }
+    }
+  }
+  
   void startDummyUser() {
     print('🚗 Starting dummy user: $_userId in convoy: $_convoyId');
     print('🗺️ Route: Kings Cross → Hampstead Heath (${_routePoints.length} waypoints)');
-    _convoyService.connect(_userId, convoyId: _convoyId).then((success) {
-      print('DUMMY USER CONNECT RESULT: $success');
-      if (success) {
-        _movementTimer = Timer.periodic(Duration(milliseconds: _updateInterval), (timer) {
-          _updatePosition();
-        });
-      } else {
-        print('❌ Dummy user failed to connect, not starting movement timer.');
-      }
+    _fetchRoutePolyline().then((_) {
+      _convoyService.connect(_userId, convoyId: _convoyId).then((success) {
+        print('DUMMY USER CONNECT RESULT: $success');
+        if (success) {
+          _movementTimer = Timer.periodic(Duration(milliseconds: _updateInterval), (timer) {
+            _updatePosition();
+          });
+        } else {
+          print('❌ Dummy user failed to connect, not starting movement timer.');
+        }
+      });
     });
   }
   
@@ -57,40 +82,28 @@ class DummyUserService {
   }
   
   void _updatePosition() {
-    if (_currentRouteIndex >= _routePoints.length - 1) {
+    if (_routePolyline.length < 2) return;
+    if (_currentPolylineIndex >= _routePolyline.length - 1) {
       // Reached destination, restart journey
-      _currentRouteIndex = 0;
-      _progressAlongSegment = 0.0;
+      _currentPolylineIndex = 0;
+      _progressAlongPolyline = 0.0;
       print('🔄 Dummy user restarting journey from Kings Cross');
     }
-    
-    // Calculate current position along route
-    final currentPoint = _routePoints[_currentRouteIndex];
-    final nextPoint = _routePoints[_currentRouteIndex + 1];
-    
-    // Interpolate position between current and next waypoint
-    final lat = currentPoint.latitude + (nextPoint.latitude - currentPoint.latitude) * _progressAlongSegment;
-    final lng = currentPoint.longitude + (nextPoint.longitude - currentPoint.longitude) * _progressAlongSegment;
-    final interpolatedPosition = LatLng(lat, lng);
-    
-    // Build remaining route polyline: start with interpolated position, then remaining waypoints
+    final currentPoint = _routePolyline[_currentPolylineIndex];
+    final nextPoint = _routePolyline[_currentPolylineIndex + 1];
+    final lng = currentPoint[0] + (nextPoint[0] - currentPoint[0]) * _progressAlongPolyline;
+    final lat = currentPoint[1] + (nextPoint[1] - currentPoint[1]) * _progressAlongPolyline;
+    final interpolatedPosition = [lng, lat];
+    // Build remaining route polyline: start with interpolated position, then remaining polyline points
     List<List<double>> remainingRoute = [
-      [interpolatedPosition.longitude, interpolatedPosition.latitude],
-      ..._routePoints
-        .sublist(_currentRouteIndex + 1)
-        .map((p) => [p.longitude, p.latitude])
+      interpolatedPosition,
+      ..._routePolyline.sublist(_currentPolylineIndex + 1)
     ];
-    
-    // Calculate heading (direction of travel)
     _currentHeading = _calculateHeading(currentPoint, nextPoint);
-    
-    // Simulate realistic speed variations
     _currentSpeed = _simulateSpeed();
-    
-    // Create location data
     final locationData = {
       'type': 'location_update',
-      'coordinates': [lng, lat],
+      'coordinates': interpolatedPosition,
       'velocity': _currentSpeed,
       'heading': _currentHeading,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
@@ -98,35 +111,29 @@ class DummyUserService {
       'isOnJourney': _isOnJourney,
       'routePoints': _isOnJourney ? remainingRoute : null,
     };
-    
-    // Send to convoy service
-    print('DUMMY USER SENDING LOCATION: $locationData');
     _convoyService.sendLocationUpdate(locationData);
-    
-    // Log progress
-    final progressPercent = ((_currentRouteIndex + _progressAlongSegment) / (_routePoints.length - 1) * 100).round();
-    print('🚗 Dummy user: ${progressPercent}% complete - [${lat.toStringAsFixed(6)}, ${lng.toStringAsFixed(6)}] - ${(_currentSpeed * 3.6).round()} km/h');
-    
+    final progressPercent = ((_currentPolylineIndex + _progressAlongPolyline) / (_routePolyline.length - 1) * 100).round();
+    print('🚗 Dummy user: ${progressPercent}% complete - [$lng, $lat] - ${(_currentSpeed * 3.6).round()} km/h');
     // Update progress
-    _progressAlongSegment += _currentSpeed * _updateInterval / 1000 / _calculateDistance(currentPoint, nextPoint);
-    
-    if (_progressAlongSegment >= 1.0) {
-      _progressAlongSegment = 0.0;
-      _currentRouteIndex++;
-      print('📍 Dummy user reached waypoint ${_currentRouteIndex + 1}/${_routePoints.length}');
+    final segmentDistance = _calculateDistance(currentPoint, nextPoint);
+    _progressAlongPolyline += _currentSpeed * _updateInterval / 1000 / segmentDistance;
+    if (_progressAlongPolyline >= 1.0) {
+      _progressAlongPolyline = 0.0;
+      _currentPolylineIndex++;
+      print('📍 Dummy user reached polyline point ${_currentPolylineIndex + 1}/${_routePolyline.length}');
     }
   }
   
-  double _calculateHeading(LatLng from, LatLng to) {
-    final deltaLng = to.longitude - from.longitude;
-    final deltaLat = to.latitude - from.latitude;
+  double _calculateHeading(List<double> from, List<double> to) {
+    final deltaLng = to[0] - from[0];
+    final deltaLat = to[1] - from[1];
     return atan2(deltaLng, deltaLat) * 180 / pi;
   }
   
-  double _calculateDistance(LatLng from, LatLng to) {
+  double _calculateDistance(List<double> from, List<double> to) {
     // Simple distance calculation (for demo purposes)
-    final deltaLat = to.latitude - from.latitude;
-    final deltaLng = to.longitude - from.longitude;
+    final deltaLat = to[1] - from[1];
+    final deltaLng = to[0] - from[0];
     return sqrt(deltaLat * deltaLat + deltaLng * deltaLng) * 111000; // Rough conversion to meters
   }
   
