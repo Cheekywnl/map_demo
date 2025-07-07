@@ -39,9 +39,15 @@ class DummyUserService {
   void startDummyUser() {
     print('🚗 Starting dummy user: $_userId in convoy: $_convoyId');
     print('🗺️ Route: Kings Cross → Hampstead Heath (${_routePoints.length} waypoints)');
-    
-    _movementTimer = Timer.periodic(Duration(milliseconds: _updateInterval), (timer) {
-      _updatePosition();
+    _convoyService.connect(_userId, convoyId: _convoyId).then((success) {
+      print('DUMMY USER CONNECT RESULT: $success');
+      if (success) {
+        _movementTimer = Timer.periodic(Duration(milliseconds: _updateInterval), (timer) {
+          _updatePosition();
+        });
+      } else {
+        print('❌ Dummy user failed to connect, not starting movement timer.');
+      }
     });
   }
   
@@ -65,6 +71,15 @@ class DummyUserService {
     // Interpolate position between current and next waypoint
     final lat = currentPoint.latitude + (nextPoint.latitude - currentPoint.latitude) * _progressAlongSegment;
     final lng = currentPoint.longitude + (nextPoint.longitude - currentPoint.longitude) * _progressAlongSegment;
+    final interpolatedPosition = LatLng(lat, lng);
+    
+    // Build remaining route polyline: start with interpolated position, then remaining waypoints
+    List<List<double>> remainingRoute = [
+      [interpolatedPosition.longitude, interpolatedPosition.latitude],
+      ..._routePoints
+        .sublist(_currentRouteIndex + 1)
+        .map((p) => [p.longitude, p.latitude])
+    ];
     
     // Calculate heading (direction of travel)
     _currentHeading = _calculateHeading(currentPoint, nextPoint);
@@ -81,10 +96,11 @@ class DummyUserService {
       'timestamp': DateTime.now().millisecondsSinceEpoch,
       'accuracy': 5.0,
       'isOnJourney': _isOnJourney,
-      'routePoints': _isOnJourney ? _routePoints.map((p) => [p.longitude, p.latitude]).toList() : null,
+      'routePoints': _isOnJourney ? remainingRoute : null,
     };
     
     // Send to convoy service
+    print('DUMMY USER SENDING LOCATION: $locationData');
     _convoyService.sendLocationUpdate(locationData);
     
     // Log progress

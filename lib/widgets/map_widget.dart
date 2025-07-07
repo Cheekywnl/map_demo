@@ -7,6 +7,7 @@ import 'dart:convert';
 import 'dart:async';
 import '../services/convoy_service.dart';
 import '../services/dummy_user_service.dart';
+import 'package:collection/collection.dart';
 
 class SearchResult {
   final String name;
@@ -88,15 +89,22 @@ class _MapWidgetState extends State<MapWidget> {
   void _setupConvoyListeners() {
     // Listen for convoy member location updates
     _convoyService.locationUpdates.listen((location) {
-      setState(() {
-        // Update member marker
+      bool markerChanged = false;
+      bool routeChanged = false;
+      // Only update marker if position changed
+      if (!_convoyMarkers.containsKey(location.userId) ||
+          _convoyMarkers[location.userId]!.point != location.coordinates) {
         _convoyMarkers[location.userId] = Marker(
           point: location.coordinates,
           width: 40,
           height: 40,
           child: Container(
             decoration: BoxDecoration(
-              color: location.isOnJourney ? Colors.purple.withOpacity(0.8) : Colors.blue.withOpacity(0.8),
+              color: location.userId == _convoyService.userId
+                  ? Colors.blue.withOpacity(0.8)
+                  : (location.userId.startsWith('dummy_')
+                      ? Colors.purple.withOpacity(0.8)
+                      : Colors.orange.withOpacity(0.8)),
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white, width: 2),
             ),
@@ -107,16 +115,26 @@ class _MapWidgetState extends State<MapWidget> {
             ),
           ),
         );
-        
-        // Update member route if available
-        if (location.routePoints != null && location.routePoints!.isNotEmpty) {
-          _memberRoutes[location.userId] = location.routePoints!;
+        markerChanged = true;
+      }
+      // Only update route if changed
+      if (location.routePoints != null && location.routePoints!.isNotEmpty) {
+        final prevRoute = _memberRoutes[location.userId];
+        final newRoute = location.routePoints!;
+        if (prevRoute == null || prevRoute.length != newRoute.length ||
+            !ListEquality().equals(prevRoute, newRoute)) {
+          _memberRoutes[location.userId] = newRoute;
+          routeChanged = true;
         }
-      });
-      
+      }
+      if (markerChanged || routeChanged) {
+        setState(() {});
+      }
+      // Fallback: check if dummy user marker is missing after update
+      if (location.userId.startsWith('dummy_') && !_convoyMarkers.containsKey(location.userId)) {
+        print('❗ Dummy user marker NOT added for ${location.userId}');
+      }
       print('📍 Location update from ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}] - Journey: ${location.isOnJourney}');
-      
-      // If this is a dummy user, center the map on them for the first few updates
       if (location.userId.startsWith('dummy_') && _convoyMarkers.length <= 2) {
         print('🗺️ Centering map on dummy user location');
         _animatedMapMove(location.coordinates, 15.0);
@@ -154,8 +172,6 @@ class _MapWidgetState extends State<MapWidget> {
       }
     });
   }
-
-
 
   Future<void> _getCurrentLocation() async {
     print('📍 Getting current location...');
@@ -330,6 +346,23 @@ class _MapWidgetState extends State<MapWidget> {
               durationText: durationText,
             );
           });
+          // Send route points to server as part of a location update
+          if (_isInConvoy && _currentPosition != null) {
+            final locationData = {
+              'type': 'location_update',
+              'coordinates': [
+                _currentPosition!.longitude,
+                _currentPosition!.latitude
+              ],
+              'velocity': 0.0,
+              'heading': 0.0,
+              'timestamp': DateTime.now().millisecondsSinceEpoch,
+              'accuracy': _currentPosition!.accuracy,
+              'isOnJourney': true,
+              'routePoints': coordinates,
+            };
+            _convoyService.sendLocationUpdate(locationData);
+          }
         }
       }
     } catch (e) {
@@ -449,9 +482,7 @@ class _MapWidgetState extends State<MapWidget> {
     );
   }
 
-
-
-  void _startDummyUser() {
+  void _startDummyUser() async {
     if (_currentConvoyId.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('❌ Please join a convoy first')),
@@ -462,18 +493,23 @@ class _MapWidgetState extends State<MapWidget> {
     final dummyUserId = 'dummy_${DateTime.now().millisecondsSinceEpoch}';
     // Create a NEW ConvoyService for the dummy user!
     final dummyConvoyService = ConvoyService();
-    dummyConvoyService.connect(dummyUserId, convoyId: _currentConvoyId);
-    _dummyUserService = DummyUserService(dummyConvoyService, dummyUserId, _currentConvoyId);
-    _dummyUserService!.startDummyUser();
-    
-    setState(() {
-      _isDummyUserActive = true;
-    });
-    
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('🚗 Started dummy user: $dummyUserId')),
-    );
-    print('🚗 Dummy user started: $dummyUserId in convoy: $_currentConvoyId');
+    final success = await dummyConvoyService.connect(dummyUserId, convoyId: _currentConvoyId);
+    if (success) {
+      _dummyUserService = DummyUserService(dummyConvoyService, dummyUserId, _currentConvoyId);
+      _dummyUserService!.startDummyUser();
+      setState(() {
+        _isDummyUserActive = true;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('🚗 Started dummy user: $dummyUserId')),
+      );
+      print('🚗 Dummy user started: $dummyUserId in convoy: $_currentConvoyId');
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('❌ Failed to connect dummy user to convoy server')),
+      );
+      print('❌ Failed to connect dummy user to convoy server');
+    }
   }
 
   void _stopDummyUser() {
@@ -493,6 +529,7 @@ class _MapWidgetState extends State<MapWidget> {
 
   @override
   Widget build(BuildContext context) {
+    print('🟢 [build] Rendering markers: ${_convoyMarkers.keys}');
     if (_currentPosition == null) {
       return const Scaffold(
         body: Center(
@@ -507,8 +544,8 @@ class _MapWidgetState extends State<MapWidget> {
             mapController: _mapController,
             options: MapOptions(
               initialCenter: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-              initialZoom: 20.0,
-              maxZoom: 22.0,
+              initialZoom: 13.0,
+              maxZoom: 18.0,
               minZoom: 3.0,
               onMapReady: () {
                 print('🗺️ Map is ready!');
@@ -516,25 +553,12 @@ class _MapWidgetState extends State<MapWidget> {
                   _isMapReady = true;
                 });
               },
-              onPositionChanged: (position, hasGesture) {
-                if (hasGesture && position.zoom != null) {
-                  print('🔍 User zoomed to level: ${position.zoom!.toStringAsFixed(1)} at center: ${position.center!.latitude.toStringAsFixed(6)}, ${position.center!.longitude.toStringAsFixed(6)}');
-                  double newZoom = position.zoom!;
-                  if (newZoom < 5.0) {
-                    print('⚠️ Zoom level too low, adjusting to 5.0');
-                    newZoom = 5.0;
-                  }
-                  if ((newZoom - position.zoom!).abs() > 0.1) {
-                    _animatedMapMove(position.center!, newZoom);
-                  }
-                }
-              },
             ),
             children: [
               TileLayer(
                 urlTemplate: 'https://api.mapbox.com/styles/v1/mapbox/light-v11/tiles/{z}/{x}/{y}?access_token=pk.eyJ1IjoiY2hlZWt5dyIsImEiOiJjbWM3bDMzaXkwcWprMm9zM21ydmNiZHZrIn0.Ll9ev_0u6Yc9FMd-MkbZgg',
                 userAgentPackageName: 'com.example.map_here_demo',
-                maxZoom: 22,
+                maxZoom: 18,
               ),
               MarkerLayer(
                 markers: [

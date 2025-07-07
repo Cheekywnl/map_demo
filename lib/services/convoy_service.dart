@@ -113,6 +113,16 @@ class ConvoyService {
       _connectionStatusController.add('connected');
       print('✅ Connected to convoy server');
       
+      // Send join_convoy message if convoyId is provided
+      if (convoyId != null) {
+        final joinMessage = {
+          'type': 'join_convoy',
+          'convoyId': convoyId,
+        };
+        _channel?.sink.add(jsonEncode(joinMessage));
+        print('➡️ Sent join_convoy message for convoyId: $convoyId');
+      }
+      
       return true;
     } catch (e) {
       print('❌ Failed to connect: $e');
@@ -133,11 +143,11 @@ class ConvoyService {
 
   // Send location update (for dummy user)
   void sendLocationUpdate(Map<String, dynamic> locationData) {
+    print('ConvoyService.sendLocationUpdate: userId=$_userId, isConnected=$_isConnected, data=$locationData');
     if (!_isConnected) {
       print('❌ Not connected to server');
       return;
     }
-    
     _channel?.sink.add(jsonEncode(locationData));
     print('📍 Location sent: [${locationData['coordinates'][1].toStringAsFixed(6)}, ${locationData['coordinates'][0].toStringAsFixed(6)}]');
   }
@@ -221,6 +231,9 @@ class ConvoyService {
     try {
       final data = jsonDecode(message);
       final type = data['type'];
+      
+      print('📨 Received message type: $type');
+      print('📨 Message data: $data');
 
       switch (type) {
         case 'connection_established':
@@ -229,6 +242,19 @@ class ConvoyService {
 
         case 'member_location_update':
           _handleLocationUpdate(data);
+          break;
+
+        case 'all_member_locations':
+          final locations = data['locations'] as List<dynamic>;
+          final userIds = locations.map((loc) => loc['userId']).toList();
+          print('🟣 Received all_member_locations for userIds: $userIds');
+          print('🟣 Full locations data: $locations');
+          for (final loc in locations) {
+            final location = ConvoyLocation.fromJson(loc);
+            _memberLocations[location.userId] = location;
+            _locationController.add(location);
+            print('🟣 Added location for ${location.userId}: [${location.coordinates.latitude.toStringAsFixed(6)}, ${location.coordinates.longitude.toStringAsFixed(6)}]');
+          }
           break;
 
         case 'member_joined':
@@ -253,6 +279,7 @@ class ConvoyService {
       }
     } catch (e) {
       print('❌ Error parsing message: $e');
+      print('❌ Raw message: $message');
     }
   }
 

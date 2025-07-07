@@ -18,6 +18,17 @@ const convoys = new Map(); // convoyId -> convoy data
 const userLocations = new Map(); // userId -> location data
 const userConnections = new Map(); // userId -> WebSocket connection
 
+// Add default convoy on server start
+convoys.set('test123', {
+  id: 'test123',
+  name: 'Convoy test123',
+  creatorId: 'user_1751900887386',
+  members: ['user_1751900887386'],
+  createdAt: new Date().toISOString(),
+  isActive: true
+});
+console.log('🚗 Default convoy "test123" created with creator "user_1751900887386"');
+
 // HTTP Routes
 app.get('/', (req, res) => {
   res.json({ 
@@ -73,8 +84,8 @@ app.post('/convoy/join', (req, res) => {
   if (!convoy.members.includes(userId)) {
     convoy.members.push(userId);
   }
-  
   console.log(`👥 User ${userId} joined convoy ${convoyId}`);
+  console.log(`👥 Convoy ${convoyId} members after join: ${JSON.stringify(convoy.members)}`);
   res.json({ success: true, convoy });
 });
 
@@ -105,6 +116,7 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const userId = url.searchParams.get('userId');
   const convoyId = url.searchParams.get('convoyId');
+  console.log(`NEW WS: userId=${userId}, convoyId=${convoyId}`);
   
   if (!userId) {
     ws.close(1008, 'Missing userId');
@@ -144,19 +156,17 @@ wss.on('connection', (ws, req) => {
   
   // Handle disconnection
   ws.on('close', () => {
-    console.log(`👋 User ${userId} disconnected`);
-    userConnections.delete(userId);
-    
-    // Remove from convoy if needed
-    if (convoyId) {
-      const convoy = convoys.get(convoyId);
-      if (convoy) {
-        convoy.members = convoy.members.filter(id => id !== userId);
-        if (convoy.members.length === 0) {
-          convoys.delete(convoyId);
-          console.log(`🚗 Convoy ${convoyId} deleted (no members)`);
+    if (userId) {
+      // Remove user from all convoys
+      for (const convoy of Object.values(convoys)) {
+        const idx = convoy.members.indexOf(userId);
+        if (idx !== -1) {
+          convoy.members.splice(idx, 1);
         }
       }
+      // Remove connection reference
+      userConnections.delete(userId);
+      console.log(`🧹 Cleaned up user ${userId} from all convoys and closed connection.`);
     }
   });
   
@@ -198,34 +208,49 @@ function handleLocationUpdate(userId, message) {
   
   // Store location
   userLocations.set(userId, locationData);
+  console.log(`📍 Location update from ${userId}: [${locationData.coordinates[0].toFixed(6)}, ${locationData.coordinates[1].toFixed(6)}]`);
   
   // Find user's convoy
   let userConvoyId = null;
   for (const [convoyId, convoy] of convoys) {
     if (convoy.members.includes(userId)) {
       userConvoyId = convoyId;
+      // Ensure user is in members (should always be true, but just in case)
+      if (!convoy.members.includes(userId)) {
+        convoy.members.push(userId);
+        console.log(`🛠️ Added missing user ${userId} to convoy ${convoyId} during location update`);
+      }
       break;
     }
   }
   
   if (userConvoyId) {
-    // Broadcast to convoy members
+    // Gather all member locations
     const convoy = convoys.get(userConvoyId);
+    const allLocations = convoy.members.map(memberId => userLocations.get(memberId)).filter(Boolean);
+    
+    console.log(`📡 Broadcasting to convoy ${userConvoyId}:`);
+    console.log(`   Members: ${JSON.stringify(convoy.members)}`);
+    console.log(`   Locations found: ${JSON.stringify(allLocations.map(l => l.userId))}`);
+    
+    // Broadcast all member locations to every member (including sender)
     convoy.members.forEach(memberId => {
-      if (memberId !== userId) {
-        const memberWs = userConnections.get(memberId);
-        if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-          memberWs.send(JSON.stringify({
-            type: 'member_location_update',
-            convoyId: userConvoyId,
-            location: locationData
-          }));
-        }
+      const memberWs = userConnections.get(memberId);
+      if (memberWs && memberWs.readyState === WebSocket.OPEN) {
+        const broadcastMessage = {
+          type: 'all_member_locations',
+          convoyId: userConvoyId,
+          locations: allLocations
+        };
+        memberWs.send(JSON.stringify(broadcastMessage));
+        console.log(`   📤 Sent to ${memberId}: ${JSON.stringify(broadcastMessage.locations.map(l => l.userId))}`);
+      } else {
+        console.log(`   ❌ Cannot send to ${memberId}: ${memberWs ? 'WebSocket not open' : 'No connection'}`);
       }
     });
+  } else {
+    console.log(`❌ User ${userId} not found in any convoy`);
   }
-  
-  console.log(`📍 Location update from ${userId}: [${locationData.coordinates[0].toFixed(6)}, ${locationData.coordinates[1].toFixed(6)}]`);
 }
 
 // Handle joining convoy
@@ -305,6 +330,14 @@ server.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down convoy server...');
+  // Force close all WebSocket connections
+  wss.clients.forEach((client) => {
+    try {
+      client.terminate();
+    } catch (e) {
+      // Ignore errors
+    }
+  });
   wss.close(() => {
     server.close(() => {
       console.log('✅ Server shutdown complete');
